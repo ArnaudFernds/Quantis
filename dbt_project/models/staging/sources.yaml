@@ -1,0 +1,11 @@
+version: 2
+
+sources:
+  - name: gcs_raw_data
+    description: "Raw tables loaded by Airflow from GCS buckets."
+    database: quantis-475413
+    schema: finance_analytics
+    
+    tables:
+      - name: raw_income_statements  
+      - name: raw_balance_sheets

@@ -1,0 +1,35 @@
+# k8s/airflow-deployment.yaml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: airflow-webserver
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: airflow
+  template:
+    metadata:
+      labels:
+        app: airflow
+    spec:
+      containers:
+      - name: airflow-webserver
+        image: europe-west1-docker.pkg.dev/quantis-475413/airflow-apps/my-finance-app:latest
+        ports:
+        - containerPort: 8080
+        command: ["airflow", "webserver"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: airflow-service
+spec:
+  selector:
+    app: airflow
+  type: LoadBalancer
+  ports:
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080

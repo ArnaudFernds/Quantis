@@ -10,14 +10,13 @@ spec:
     metadata:
       labels: {app: airflow}
     spec:
-      serviceAccountName: airflow-ksa
       containers:
       - name: airflow-webserver
         image: europe-west1-docker.pkg.dev/fluid-stratum-475417-s9/airflow-apps/my-finance-app:latest
         ports:
         - containerPort: 8080
-        # This command now runs our new startup script
-        command: ["/opt/airflow/dags/startup.sh"]
+        # Change the command to explicitly use 'bash'
+        command: ["bash", "-c", "/opt/airflow/dags/startup.sh"]
 ---
 apiVersion: v1
 kind: Service
@@ -27,5 +26,7 @@ spec:
   selector: {app: airflow}
   type: LoadBalancer
   ports:
-  - port: 8080
-    targetPort: 8080
+    - protocol: TCP
+      port: 8080
+      targetPort: 8080
+      nodePort: 32683

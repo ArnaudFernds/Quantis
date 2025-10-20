@@ -1,35 +1,36 @@
 import pandas as pd
 
-def compute_kpis(df_bilan: pd.DataFrame, df_cdr: pd.DataFrame) -> pd.DataFrame:
-    for col in ["company", "period"]:
-        if col not in df_bilan.columns:
-            df_bilan[col] = None
-        if col not in df_cdr.columns:
-            df_cdr[col] = None
-
-    bilan_cols = ["assets","equity","debts","cash","current_assets","current_liabilities"]
-    cdr_cols = ["revenue","expenses","ebit","net_income"]
-
-    for c in bilan_cols:
-        if c not in df_bilan.columns:
-            df_bilan[c] = 0.0
-    for c in cdr_cols:
-        if c not in df_cdr.columns:
-            df_cdr[c] = 0.0
-
-    df = pd.merge(
-        df_cdr[["company","period"] + cdr_cols],
-        df_bilan[["company","period"] + bilan_cols],
-        on=["company","period"],
-        how="outer"
-    ).fillna(0)
-
-    df["margin"] = (df["revenue"] - df["expenses"]) / df["revenue"].replace({0: pd.NA})
-    df["roe"] = df["net_income"] / df["equity"].replace({0: pd.NA})
-    df["roa"] = df["net_income"] / df["assets"].replace({0: pd.NA})
-    df["working_capital"] = df["current_assets"] - df["current_liabilities"]
-    df["bfr"] = df["working_capital"]
-    df["leverage_ratio"] = df["debts"] / df["equity"].replace({0: pd.NA})
-    df["profitability"] = df["ebit"] / df["assets"].replace({0: pd.NA})
-
+def _cleanup(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.dropna(axis=0, how="all").dropna(axis=1, how="all")
     return df
+
+def _normalize_any(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Robustifier:
+    - Cas 2 colonnes: (metric,value) si la 1ère ressemble à 'metric'/'name'/... sinon fallback
+    - Cas 1 ligne n colonnes: on prend la 1ère ligne comme valeurs et on melt en (metric,value)
+    """
+    df = _cleanup(df)
+    if df.empty:
+        return pd.DataFrame(columns=["metric", "value"])
+
+    lower_cols = [c.lower() for c in df.columns]
+    # Cas (metric,value)
+    if len(df.columns) == 2 and lower_cols[0] in ("metric","kpi","name","libelle","label"):
+        out = df.rename(columns={df.columns[0]:"metric", df.columns[1]:"value"})[["metric","value"]]
+    else:
+        # on prend la 1ère ligne comme séries de valeurs, colonnes = noms de métriques
+        out = df.iloc[0:1].melt(var_name="metric", value_name="value")
+
+    out["metric"] = out["metric"].astype(str).str.strip().str.lower()
+    out["value"]  = pd.to_numeric(out["value"], errors="coerce")
+    out = out.dropna(subset=["value"])
+    return out
+
+def compute_kpis_from_frames(bilan_df: pd.DataFrame, cdr_df: pd.DataFrame) -> pd.DataFrame:
+    b = _normalize_any(bilan_df)
+    c = _normalize_any(cdr_df)
+    # On concatène tout simplement pour un premier chargement
+    return pd.concat([b, c], ignore_index=True)

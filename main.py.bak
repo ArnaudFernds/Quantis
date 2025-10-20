@@ -1,0 +1,192 @@
+import os, io, sys, datetime as dt, re
+import pandas as pd
+from google.cloud import storage, bigquery
+
+# --- Helpers lecture GCS et CSV robustes ---
+def latest_csv_uri(bucket_name, prefix=None):
+    client = storage.Client()
+    blobs = [b for b in client.list_blobs(bucket_name, prefix=prefix) if b.name.lower().endswith(".csv")]
+    if not blobs:
+        raise RuntimeError(f"Aucun CSV trouvé dans gs://{bucket_name}/{prefix or ''}")
+    latest = max(blobs, key=lambda b: b.time_created)
+    print(f"[INFO] Fichier retenu gs://{bucket_name}/{latest.name}")
+    return f"gs://{bucket_name}/{latest.name}"
+
+def _download_bytes(uri: str) -> bytes:
+    bucket, key = uri.replace("gs://","").split("/",1)
+    client = storage.Client()
+    return client.bucket(bucket).blob(key).download_as_bytes()
+
+def read_csv_smart(uri: str) -> pd.DataFrame:
+    raw = _download_bytes(uri)
+
+    # Essais de parsing : (sep, decimal)
+    trials = [
+        (";", ","), (",", "."), ("\t", "."), (";", "."), (",", ","), ("\t", ","),
+    ]
+    last_err = None
+    for sep, dec in trials:
+        try:
+            df = pd.read_csv(io.BytesIO(raw), sep=sep, decimal=dec, engine="python")
+            # Si une seule colonne ET contient plein de séparateurs => mauvais sep, on continue à tester
+            if df.shape[1] == 1 and any(x in df.columns[0] for x in [";", ",", "\t"]):
+                continue
+            # Succès
+            print(f"[INFO] Lecture OK sep='{sep}' decimal='{dec}' shape={df.shape}")
+            return df
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"Echec lecture CSV {uri} (dernier err: {last_err})")
+
+# --- Normalisation colonnes ---
+def slugify(s: str) -> str:
+    s = s.strip().lower()
+    s = re.sub(r"\(.*?\)", "", s)  # enlève parenthèses et leur contenu
+    s = s.replace("&","and")
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    s = re.sub(r"_+","_", s).strip("_")
+    return s
+
+COLMAP_CDR = {
+  "company":"company", "year":"year",
+  "revenues":"revenues",
+  "cost_of_goods_sold_cogs":"cogs",
+  "gross_profit":"gross_profit",
+  "selling_general_administrative_sga":"sga",
+  "depreciation_amortization":"depreciation",
+  "operating_income_ebit":"ebit",
+  "interest_expense":"interest_expense",
+  "income_before_tax":"ibt",
+  "income_tax":"tax",
+  "net_income":"net_income",
+}
+
+COLMAP_BS = {
+  "company":"company", "year":"year",
+  "property_plant_and_equipment":"ppe",
+  "intangible_assets":"intangibles",
+  "other_non_current_assets":"other_nca",
+  "non_current_assets":"non_current_assets",
+  "inventories":"inventories",
+  "trade_receivables":"receivables",
+  "cash_and_cash_equivalents":"cash",
+  "other_current_assets":"other_ca",
+  "current_assets":"current_assets",
+  "total_assets":"total_assets",
+  "share_capital":"share_capital",
+  "retained_earnings":"retained_earnings",
+  "net_income":"net_income_bs",
+  "equity":"equity",
+  "long_term_debt":"long_term_debt",
+  "non_current_liabilities":"non_current_liabilities",
+  "trade_payables":"payables",
+  "other_current_liabilities":"other_cl",
+  "current_liabilities":"current_liabilities",
+  "total_liabilities":"total_liabilities",
+  "total_equity_and_liabilities":"total_equity_and_liabilities",
+}
+
+def normalize_columns(df: pd.DataFrame, mapping: dict) -> pd.DataFrame:
+    orig_cols = df.columns.tolist()
+    slugged = {c: slugify(c) for c in df.columns}
+    df = df.rename(columns=slugged)
+    df = df.rename(columns={k:v for k,v in mapping.items() if k in df.columns})
+    print(f"[INFO] Colonnes avant: {orig_cols}")
+    print(f"[INFO] Colonnes après : {df.columns.tolist()}")
+    return df
+
+# --- KPI simples (exemple) ---
+def kpis_from_frames(cdr: pd.DataFrame, bs: pd.DataFrame) -> pd.DataFrame:
+    # merge sur company/year
+    df = pd.merge(cdr, bs, on=["company","year"], how="inner")
+    if df.empty:
+        raise RuntimeError("Aucune jointure possible sur (company, year). Vérifie les en-têtes et valeurs.")
+    out = []
+
+    for _, r in df.iterrows():
+        company = str(r["company"])
+        # Year peut être int/str -> tente cast
+        try:
+            year = int(r["year"])
+        except:
+            year = r["year"]
+        report_date = dt.date(year, 12, 31)
+
+        # sécurise divisions
+        def safe_div(a,b): 
+            try:
+                return float(a)/float(b) if b not in (0,None,"") else None
+            except Exception:
+                return None
+
+        # KPIs (adaptés à tes colonnes mappées)
+        vals = {
+          "Gross Margin": safe_div(r.get("gross_profit"), r.get("revenues")),
+          "Operating Margin (EBIT)": safe_div(r.get("ebit"), r.get("revenues")),
+          "Net Margin": safe_div(r.get("net_income"), r.get("revenues")),
+          "Current Ratio": safe_div(r.get("current_assets"), r.get("current_liabilities")),
+          "Quick Ratio": safe_div(r.get("current_assets") - r.get("inventories",0), r.get("current_liabilities")),
+          "Debt-to-Equity": safe_div(r.get("long_term_debt"), r.get("equity")),
+          "ROA": safe_div(r.get("net_income"), r.get("total_assets")),
+          "ROE": safe_div(r.get("net_income"), r.get("equity")),
+          "Working Capital": None if (r.get("current_assets") is None or r.get("current_liabilities") is None) \
+                              else float(r.get("current_assets")) - float(r.get("current_liabilities")),
+        }
+        for name, val in vals.items():
+            out.append({
+                "company_name": company,
+                "report_date": report_date.isoformat(),
+                "kpi_name": name,
+                "kpi_value": None if val is None else float(val),
+                "kpi_category": "finance",
+                "kpi_unit": "ratio" if "Margin" in name or "Ratio" in name or name in ("ROA","ROE","Debt-to-Equity") else "currency",
+                "calculation_ts": dt.datetime.utcnow().isoformat()
+            })
+    return pd.DataFrame(out)
+
+def main():
+    project   = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("PROJECT") or os.environ.get("PROJECT_ID")
+    dataset   = os.environ["BQ_DATASET"]
+    table     = os.environ["BQ_TABLE"]
+    bkt_bilan = os.environ["GCS_BUCKET_BILAN"]
+    bkt_cdr   = os.environ["GCS_BUCKET_CDR"]
+
+    print(f"[INFO] Buckets: bilan={bkt_bilan} cdr={bkt_cdr}")
+    print(f"[INFO] Projet={project} Dataset={dataset} Table={table}")
+
+    bilan_uri = latest_csv_uri(bkt_bilan)
+    cdr_uri   = latest_csv_uri(bkt_cdr)
+
+    df_bilan_raw = read_csv_smart(bilan_uri)
+    df_cdr_raw   = read_csv_smart(cdr_uri)
+    print(f"[INFO] RAW shapes: bilan={df_bilan_raw.shape} cdr={df_cdr_raw.shape}")
+
+    df_bilan = normalize_columns(df_bilan_raw, COLMAP_BS)
+    df_cdr   = normalize_columns(df_cdr_raw, COLMAP_CDR)
+
+    # Vérifie colonnes clés
+    for need, name in [(df_cdr, "CDR"), (df_bilan, "BILAN")]:
+        if "company" not in need.columns or "year" not in need.columns:
+            raise KeyError(f"[{name}] colonnes 'company' et 'year' requises après normalisation.")
+
+    out = kpis_from_frames(df_cdr, df_bilan)
+    if out.empty or out["kpi_value"].isna().all():
+        raise RuntimeError("Aucun KPI calculé ou toutes les valeurs sont nulles")
+
+    print(f"[INFO] Lignes prêtes: {len(out)}  Colonnes: {list(out.columns)}")
+    client = bigquery.Client(project=project)
+    table_id = f"{project}.{dataset}.{table}"
+    job = client.load_table_from_dataframe(
+        out.astype({"kpi_value":"float64"}), table_id,
+        job_config=bigquery.LoadJobConfig(write_disposition="WRITE_APPEND")
+    )
+    job.result()
+    print("[INFO] BigQuery: WRITE_APPEND OK")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print(f"[ERROR] {e}", file=sys.stderr)
+        sys.exit(1)

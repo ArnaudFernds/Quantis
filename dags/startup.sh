@@ -1,4 +1,3 @@
-#!/bin/bash
 airflow db init
 
 airflow users create \

@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: airflow-webserver
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: airflow}
+  template:
+    metadata:
+      labels: {app: airflow}
+    spec:
+      serviceAccountName: airflow-ksa
+      containers:
+      - name: airflow-webserver
+        image: europe-west1-docker.pkg.dev/fluid-stratum-475417-s9/airflow-apps/my-finance-app:latest
+        ports:
+        - containerPort: 8080
+        # This command now runs our new startup script
+        command: ["/opt/airflow/dags/startup.sh"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: airflow-service
+spec:
+  selector: {app: airflow}
+  type: LoadBalancer
+  ports:
+  - port: 8080
+    targetPort: 8080

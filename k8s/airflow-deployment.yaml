@@ -1,3 +1,4 @@
+# Fichier de déploiement pour Airflow sur Kubernetes
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -10,23 +11,34 @@ spec:
     metadata:
       labels: {app: airflow}
     spec:
+      # Utilise l'identité Kubernetes que nous avons configurée pour Workload Identity
+      serviceAccountName: airflow-ksa
       containers:
       - name: airflow-webserver
+        # Assurez-vous que ce chemin est exactement celui de votre image sur Artifact Registry
         image: europe-west1-docker.pkg.dev/fluid-stratum-475417-s9/airflow-apps/my-finance-app:latest
+        # Force Kubernetes à toujours télécharger la dernière version de l'image
+        imagePullPolicy: Always
         ports:
         - containerPort: 8080
-        # Change the command to explicitly use 'bash'
+        # La commande de démarrage qui exécute le script avec bash
         command: ["bash", "-c", "/opt/airflow/dags/startup.sh"]
 ---
+# Fichier de service pour exposer Airflow sur une IP externe
 apiVersion: v1
 kind: Service
 metadata:
   name: airflow-service
 spec:
-  selector: {app: airflow}
+  selector:
+    app: airflow
+  # Crée une adresse IP publique externe
   type: LoadBalancer
   ports:
-    - protocol: TCP
-      port: 8080
-      targetPort: 8080
-      nodePort: 32683
+  - protocol: TCP
+    # Le port externe (celui que vous utilisez dans le navigateur)
+    port: 8080
+    # Le port interne du conteneur
+    targetPort: 8080
+    # Le port fixe sur les nœuds du cluster (pour la règle de pare-feu)
+    nodePort: 30080

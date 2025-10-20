@@ -1,61 +1,62 @@
-# dags/daily_finance_dag.py
-
 import pendulum
-from airflow.decorators import dag, task_group
-from airflow.models.variable import Variable
-from airflow.providers.google.cloud.operators.gcs import GCSListOperator
-from airflow.providers.google.cloud.transfers.gcs_to_bigquery import GCSToBigQueryOperator
+from airflow.decorators import dag
+from airflow.providers.google.cloud.transfers.gcs_to_bigquery import (
+    GCSToBigQueryOperator,
+)
 from airflow.operators.bash import BashOperator
 
-# --- Configuration from Airflow Variables ---
-GCP_CONN_ID = "google_cloud_default"
-BIGQUERY_DATASET = Variable.get("BIGQUERY_DATASET")
-INCOME_BUCKET = Variable.get("INCOME_STATEMENT_BUCKET")
-BALANCE_BUCKET = Variable.get("BALANCE_SHEET_BUCKET")
 DBT_PROJECT_DIR = "/opt/airflow/dbt_project"
 
+
 @dag(
-    dag_id="daily_full_refresh_financials",
+    dag_id="daily_financial_kpi_ingestion",
     start_date=pendulum.datetime(2025, 1, 1, tz="Europe/Paris"),
-    schedule_interval="@daily",  # <-- Runs once per day
+    schedule="@daily",  # Utilise 'schedule' au lieu de 'schedule_interval'
     catchup=False,
-    tags=["finance", "daily-refresh"],
+    tags=["finance", "kpi"],
 )
-def daily_financials_pipeline():
+def financial_kpi_ingestion():
+    """
+    Ce DAG charge les états financiers depuis GCS vers BigQuery,
+    puis lance les transformations dbt pour calculer les KPIs.
+    """
 
-    @task_group(group_id="process_buckets")
-    def process_buckets():
-        # --- Process Income Statement Bucket ---
-        GCSToBigQueryOperator(
-            task_id="load_income_statement_to_bq",
-            bucket=INCOME_BUCKET,
-            source_objects=["income_statement.csv"], # <-- Reads a specific file from the root
-            destination_project_dataset_table=f"{BIGQUERY_DATASET}.raw_income_statements",
-            field_delimiter=";",
-            write_disposition="WRITE_TRUNCATE", # <-- Erases and replaces the table data
-            skip_leading_rows=1,
-            autodetect=True,
-            gcp_conn_id=GCP_CONN_ID
-        )
+    # Tâche pour charger le compte de résultat
+    load_income_statement = GCSToBigQueryOperator(
+        task_id="load_income_statement",
+        # Utilise le templating Jinja pour lire les variables au moment de l'exécution
+        bucket="{{ var.value.INCOME_STATEMENT_BUCKET }}",
+        source_objects=["income_statement.csv"],
+        destination_project_dataset_table="{{ var.value.BIGQUERY_DATASET }}.raw_income_statements",
+        write_disposition="WRITE_TRUNCATE",
+        field_delimiter=";",
+        skip_leading_rows=1,
+        autodetect=True,
+        gcp_conn_id="google_cloud_default",
+    )
 
-        # --- Process Balance Sheet Bucket ---
-        GCSToBigQueryOperator(
-            task_id="load_balance_sheet_to_bq",
-            bucket=BALANCE_BUCKET,
-            source_objects=["balance_sheet.csv"], # <-- Reads a specific file from the root
-            destination_project_dataset_table=f"{BIGQUERY_DATASET}.raw_balance_sheets",
-            field_delimiter=";",
-            write_disposition="WRITE_TRUNCATE", # <-- Erases and replaces the table data
-            skip_leading_rows=1,
-            autodetect=True,
-            gcp_conn_id=GCP_CONN_ID
-        )
-    
+    # Tâche pour charger le bilan
+    load_balance_sheet = GCSToBigQueryOperator(
+        task_id="load_balance_sheet",
+        bucket="{{ var.value.BALANCE_SHEET_BUCKET }}",
+        source_objects=["balance_sheet.csv"],
+        destination_project_dataset_table="{{ var.value.BIGQUERY_DATASET }}.raw_balance_sheets",
+        write_disposition="WRITE_TRUNCATE",
+        field_delimiter=";",
+        skip_leading_rows=1,
+        autodetect=True,
+        gcp_conn_id="google_cloud_default",
+    )
+
+    # Tâche pour lancer les transformations dbt
     run_dbt_transformations = BashOperator(
         task_id="run_dbt_transformations",
         bash_command=f"cd {DBT_PROJECT_DIR} && dbt run",
     )
 
-    process_buckets() >> run_dbt_transformations
+    # Définit l'ordre des tâches
+    [load_income_statement, load_balance_sheet] >> run_dbt_transformations
 
-daily_financials_pipeline()
+
+# Instancie le DAG
+financial_kpi_ingestion()
